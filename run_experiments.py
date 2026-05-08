@@ -144,7 +144,7 @@ def main() -> int:
         "--benchmark-source",
         choices=["paper", "fdm", "mc", "none"],
         default="paper",
-        help="Benchmark source: paper tables, PDE/FDM solver, internal high-resolution MC, or none.",
+        help="Benchmark source: paper tables, Group 16 ADI-FD solver, internal high-resolution MC, or none.",
     )
     args = parser.parse_args()
 

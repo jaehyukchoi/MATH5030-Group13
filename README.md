@@ -125,7 +125,7 @@ Algorithm 3 then samples the CEV transition exactly using a Gamma-Poisson-Gamma 
 - Figure 2 / Table 7 convergence dataset
 - Figure 3 comparison dataset between the paper scheme and Islah's approximation
 - PyFeng analytic approximation rows where the package already provides them, plus paper-reference rows for the remaining baselines
-- A 2D SABR PDE / finite-difference benchmark solver in `(F, log sigma)` coordinates
+- Group 16 ADI finite-difference benchmark integration through the `mafn-finite-difference` package
 - CLI support for switching benchmark sources with `--benchmark-source paper|fdm|mc|none`
 - A regression test covering the `rho = 1` Islah edge case
 - A notebook with extra sanity checks outside the paper tables:
@@ -142,7 +142,7 @@ Algorithm 3 then samples the CEV transition exactly using a Gamma-Poisson-Gamma 
 
 ## Current status
 
-Paper-scale validation with the built-in PDE/FDM benchmark currently reports:
+Paper-scale validation with the ADI-FD benchmark currently reports:
 
 - overall conclusion: `Implementation consistent with paper`
 - replication conclusion: `Replication likely successful`
@@ -208,11 +208,12 @@ For the path-dependent Asian option extension, open:
 
 - The paper's formulas were transcribed from the PDF and implemented directly.
 - We now rely on [PyFENG](https://pyfeng.readthedocs.io/en/latest/) for building blocks it already exposes well: conditional average-variance moments, shifted-lognormal moment fitting, and several analytic SABR approximation models.
+- FDM benchmarks are delegated to Group 16's [`mafn-finite-difference`](https://github.com/py2025/finite-difference) package, which implements a Douglas-scheme ADI SABR solver and cites von Sydow et al. (2010), "ADI finite difference schemes for option pricing in the Heston model with correlation."
 - The project directly reproduces the paper's proposed simulation method. Several competing baseline rows are included from PyFeng or paper-reference values rather than being fully reimplemented from scratch.
 - `--benchmark-source paper` uses the tabulated paper benchmarks when they are available.
-- `--benchmark-source fdm` recomputes benchmark prices with the built-in PDE/FDM solver.
+- `--benchmark-source fdm` recomputes benchmark prices with Group 16's ADI finite-difference package.
 - `table7` / `figure3` fall back to the internal high-resolution Monte Carlo benchmark unless `--benchmark-source fdm` is requested.
-- This is now a stronger reproduction scaffold with direct table/figure entrypoints and a built-in PDE benchmark, but it is still not a finished paper-grade reproduction package.
+- This is now a stronger reproduction scaffold with direct table/figure entrypoints and an external ADI-FD benchmark integration, but it is still not a finished paper-grade reproduction package.
 - The saved validation CSVs are written as `validation_table1_df.csv`, `validation_table2_df.csv`, and `validation_martingale_df.csv` inside the output directory.
 - The fastest path from here is:
   1. replace paper-reference baseline rows with actual baseline implementations,

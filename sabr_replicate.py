@@ -170,6 +170,19 @@ def _validation_label(score: int) -> str:
     return "FAIL"
 
 
+def _group16_price_sabr_option():
+    """Import Group 16's ADI-FD pricer only when an FDM benchmark is requested."""
+    try:
+        from finite_difference import price_sabr_option
+    except Exception as exc:  # pragma: no cover - environment-specific dependency failure
+        raise ImportError(
+            "Group 16 finite-difference package is required for FDM benchmarks. "
+            "Install it with `python -m pip install mafn-finite-difference` and run "
+            "with Python 3.10 or newer."
+        ) from exc
+    return price_sabr_option
+
+
 @dataclass(frozen=True)
 class SABRParams:
     f0: float
@@ -208,6 +221,7 @@ class FDMConfig:
     min_n_t: int = 240
     theta: float = 0.5
     f_max: float | None = None
+    v_max: float | None = None
     y_span: float | None = None
     sigma_floor: float = 1e-4
 
@@ -217,242 +231,18 @@ class FDMConfig:
         return max(self.min_n_t, int(math.ceil(self.n_t_per_year * maturity)))
 
 
-def _bounded_divide(x: np.ndarray) -> np.ndarray:
-    """Keep denominators away from zero inside the batched tridiagonal solver."""
-    x = np.asarray(x, dtype=float)
-    signs = np.where(x >= 0.0, 1.0, -1.0)
-    return np.where(np.abs(x) > PDF_FLOOR, x, signs * PDF_FLOOR)
-
-
-def _solve_tridiagonal_batch(
-    lower: np.ndarray,
-    diag: np.ndarray,
-    upper: np.ndarray,
-    rhs: np.ndarray,
-) -> np.ndarray:
-    """Solve a batch of tridiagonal systems with the Thomas algorithm.
-
-    Each input has shape `(batch, n)` where `n` is the system size.
-    """
-    lower = np.asarray(lower, dtype=float)
-    diag = np.asarray(diag, dtype=float)
-    upper = np.asarray(upper, dtype=float)
-    rhs = np.asarray(rhs, dtype=float)
-
-    if rhs.ndim != 2:
-        raise ValueError("rhs must be a 2D array with shape (batch, n)")
-    batch, n = rhs.shape
-    if n == 0:
-        return rhs.copy()
-
-    c_prime = np.zeros_like(rhs)
-    d_prime = np.zeros_like(rhs)
-    solution = np.zeros_like(rhs)
-
-    denom0 = _bounded_divide(diag[:, 0])
-    if n > 1:
-        c_prime[:, 0] = upper[:, 0] / denom0
-    d_prime[:, 0] = rhs[:, 0] / denom0
-
-    for idx in range(1, n):
-        denom = _bounded_divide(diag[:, idx] - lower[:, idx] * c_prime[:, idx - 1])
-        if idx < n - 1:
-            c_prime[:, idx] = upper[:, idx] / denom
-        d_prime[:, idx] = (rhs[:, idx] - lower[:, idx] * d_prime[:, idx - 1]) / denom
-
-    solution[:, -1] = d_prime[:, -1]
-    for idx in range(n - 2, -1, -1):
-        solution[:, idx] = d_prime[:, idx] - c_prime[:, idx] * solution[:, idx + 1]
-    return solution
-
-
-def _default_fmax(params: SABRParams, maturity: float, max_strike: float) -> float:
-    """Heuristic upper F boundary for the PDE grid."""
-    base_level = max(params.f0, max_strike, 1e-6)
-    effective_scale = params.sigma0 * (base_level ** max(params.beta, 0.0)) * math.sqrt(max(maturity, EPS))
-    effective_scale *= 1.0 + 0.5 * params.nu * math.sqrt(max(maturity, 0.0))
-    candidate = max_strike + 12.0 * effective_scale + 2.0 * params.f0
-    return max(4.0 * max(params.f0, max_strike), candidate, max_strike + 1.0)
-
-
-def _default_y_span(params: SABRParams, maturity: float) -> float:
-    """Choose a log-volatility span wide enough for the SABR benchmark cases."""
-    return min(max(2.5, 4.0 * params.nu * math.sqrt(max(maturity, EPS))), 4.5)
-
-
-def _prepare_fdm_environment(
-    params: SABRParams,
-    maturity: float,
-    strikes: Sequence[float],
-    config: FDMConfig | None = None,
-) -> dict[str, object]:
-    """Build the grids and operator coefficients used by the SABR PDE solver."""
-    cfg = FDMConfig() if config is None else config
-    max_strike = float(max(strikes))
-    f_max = _default_fmax(params, maturity, max_strike) if cfg.f_max is None else float(cfg.f_max)
-    y_span = _default_y_span(params, maturity) if cfg.y_span is None else float(cfg.y_span)
-
-    y_center = math.log(max(params.sigma0, cfg.sigma_floor))
-    y_min = math.log(max(cfg.sigma_floor, math.exp(y_center - y_span)))
-    y_max = y_center + y_span
-
-    f_grid = np.linspace(0.0, f_max, cfg.n_f + 1)
-    y_grid = np.linspace(y_min, y_max, cfg.n_y + 1)
-    sigma_grid = np.exp(y_grid)
-    d_f = float(f_grid[1] - f_grid[0])
-    d_y = float(y_grid[1] - y_grid[0])
-    n_t = cfg.resolved_n_t(maturity)
-
-    f_interior = np.maximum(f_grid[1:-1], 0.0)[None, :]
-    sigma_interior = sigma_grid[1:-1][:, None]
-    a_f = 0.5 * sigma_interior * sigma_interior * (f_interior ** (2.0 * params.beta))
-    a_cross = params.rho * params.nu * sigma_interior * (f_interior ** params.beta)
-
-    a_y_lower = 0.5 * params.nu * params.nu / (d_y * d_y) + 0.25 * params.nu * params.nu / d_y
-    a_y_diag = -params.nu * params.nu / (d_y * d_y)
-    a_y_upper = 0.5 * params.nu * params.nu / (d_y * d_y) - 0.25 * params.nu * params.nu / d_y
-
-    return {
-        "config": cfg,
-        "f_grid": f_grid,
-        "y_grid": y_grid,
-        "sigma_grid": sigma_grid,
-        "d_f": d_f,
-        "d_y": d_y,
-        "n_t": n_t,
-        "theta": float(cfg.theta),
-        "a_f": a_f,
-        "a_cross": a_cross,
-        "a_y_lower": float(a_y_lower),
-        "a_y_diag": float(a_y_diag),
-        "a_y_upper": float(a_y_upper),
-        "maturity": float(maturity),
-    }
-
-
-def _apply_pde_boundaries(surface: np.ndarray, f_grid: np.ndarray, strike: float) -> None:
-    """Apply call-option boundary conditions on the `(y, F)` PDE grid in place."""
-    intrinsic = np.maximum(f_grid - strike, 0.0)
-    surface[:, 0] = 0.0
-    surface[:, -1] = float(np.maximum(f_grid[-1] - strike, 0.0))
-    surface[0, :] = intrinsic
-    if surface.shape[0] >= 2:
-        surface[-1, :] = surface[-2, :]
-    surface[0, 0] = 0.0
-    surface[0, -1] = float(np.maximum(f_grid[-1] - strike, 0.0))
-    surface[-1, 0] = 0.0
-    surface[-1, -1] = float(np.maximum(f_grid[-1] - strike, 0.0))
-
-
-def _apply_f_operator(surface: np.ndarray, a_f: np.ndarray, d_f: float) -> np.ndarray:
-    out = np.zeros_like(surface)
-    out[1:-1, 1:-1] = a_f * (
-        surface[1:-1, 2:] - 2.0 * surface[1:-1, 1:-1] + surface[1:-1, :-2]
-    ) / (d_f * d_f)
-    return out
-
-
-def _apply_y_operator(
-    surface: np.ndarray,
-    a_y_lower: float,
-    a_y_diag: float,
-    a_y_upper: float,
-) -> np.ndarray:
-    out = np.zeros_like(surface)
-    out[1:-1, 1:-1] = (
-        a_y_lower * surface[:-2, 1:-1]
-        + a_y_diag * surface[1:-1, 1:-1]
-        + a_y_upper * surface[2:, 1:-1]
-    )
-    return out
-
-
-def _apply_cross_operator(surface: np.ndarray, a_cross: np.ndarray, d_f: float, d_y: float) -> np.ndarray:
-    out = np.zeros_like(surface)
-    out[1:-1, 1:-1] = a_cross * (
-        surface[2:, 2:] - surface[2:, :-2] - surface[:-2, 2:] + surface[:-2, :-2]
-    ) / (4.0 * d_f * d_y)
-    return out
-
-
-def _solve_f_implicit(rhs: np.ndarray, stage_surface: np.ndarray, a_f: np.ndarray, dt_theta: float, d_f: float) -> np.ndarray:
-    alpha = dt_theta * a_f / (d_f * d_f)
-    lower = -alpha.copy()
-    diag = 1.0 + 2.0 * alpha
-    upper = -alpha.copy()
-    lower[:, 0] = 0.0
-    upper[:, -1] = 0.0
-
-    rhs_adj = rhs.copy()
-    rhs_adj[:, 0] += alpha[:, 0] * stage_surface[1:-1, 0]
-    rhs_adj[:, -1] += alpha[:, -1] * stage_surface[1:-1, -1]
-    return _solve_tridiagonal_batch(lower, diag, upper, rhs_adj)
-
-
-def _solve_y_implicit(
-    rhs: np.ndarray,
-    stage_surface: np.ndarray,
-    a_y_lower: float,
-    a_y_diag: float,
-    a_y_upper: float,
-    dt_theta: float,
-) -> np.ndarray:
-    rhs_t = rhs.T.copy()
-    batch, n = rhs_t.shape
-    lower = np.full((batch, n), -dt_theta * a_y_lower, dtype=float)
-    diag = np.full((batch, n), 1.0 - dt_theta * a_y_diag, dtype=float)
-    upper = np.full((batch, n), -dt_theta * a_y_upper, dtype=float)
-    lower[:, 0] = 0.0
-    upper[:, -1] = 0.0
-
-    rhs_t[:, 0] += dt_theta * a_y_lower * stage_surface[0, 1:-1]
-    rhs_t[:, -1] += dt_theta * a_y_upper * stage_surface[-1, 1:-1]
-    return _solve_tridiagonal_batch(lower, diag, upper, rhs_t).T
-
-
-def _bilinear_interpolate(
-    x_grid: np.ndarray,
-    y_grid: np.ndarray,
-    values: np.ndarray,
-    x0: float,
-    y0: float,
-) -> float:
-    """Bilinear interpolation on a tensor grid."""
-    ix = int(np.clip(np.searchsorted(x_grid, x0) - 1, 0, len(x_grid) - 2))
-    iy = int(np.clip(np.searchsorted(y_grid, y0) - 1, 0, len(y_grid) - 2))
-
-    x1, x2 = float(x_grid[ix]), float(x_grid[ix + 1])
-    y1, y2 = float(y_grid[iy]), float(y_grid[iy + 1])
-    q11 = float(values[iy, ix])
-    q12 = float(values[iy + 1, ix])
-    q21 = float(values[iy, ix + 1])
-    q22 = float(values[iy + 1, ix + 1])
-
-    if abs(x2 - x1) < EPS or abs(y2 - y1) < EPS:
-        return q11
-
-    wx = (x0 - x1) / (x2 - x1)
-    wy = (y0 - y1) / (y2 - y1)
-    return (
-        (1.0 - wx) * (1.0 - wy) * q11
-        + (1.0 - wx) * wy * q12
-        + wx * (1.0 - wy) * q21
-        + wx * wy * q22
-    )
-
-
 def finite_difference_call_prices(
     params: SABRParams,
     maturity: float,
     strikes: Sequence[float],
     config: FDMConfig | None = None,
 ) -> pd.DataFrame:
-    """Price European calls with a 2D SABR finite-difference benchmark solver.
+    """Price European calls with Group 16's ADI finite-difference package.
 
-    The PDE is solved in `(F, y)` coordinates with `y = log(sigma)` using a
-    Douglas-style ADI splitting with the mixed derivative kept explicit. The
-    returned prices are intended as PDE/FDM
-    benchmarks rather than a production-grade calibration engine.
+    The target paper uses finite-difference prices as benchmarks but does not
+    specify an ADI implementation. Following the project feedback, this wrapper
+    delegates benchmark calculations to Group 16's `mafn-finite-difference`
+    package instead of maintaining a separate in-repository ADI solver.
     """
     if maturity <= 0.0:
         strikes_arr = np.asarray(strikes, dtype=float)
@@ -464,57 +254,28 @@ def finite_difference_call_prices(
             }
         )
 
-    env = _prepare_fdm_environment(params, maturity, strikes, config=config)
-    f_grid = env["f_grid"]
-    y_grid = env["y_grid"]
-    d_f = float(env["d_f"])
-    d_y = float(env["d_y"])
-    n_t = int(env["n_t"])
-    theta = float(env["theta"])
-    a_f = env["a_f"]
-    a_cross = env["a_cross"]
-    a_y_lower = float(env["a_y_lower"])
-    a_y_diag = float(env["a_y_diag"])
-    a_y_upper = float(env["a_y_upper"])
-    dt = float(maturity) / n_t
-
+    cfg = FDMConfig() if config is None else config
+    price_sabr_option = _group16_price_sabr_option()
     prices = []
-    y0 = math.log(max(params.sigma0, env["config"].sigma_floor))
-
     for strike in strikes:
-        payoff = np.maximum(f_grid - float(strike), 0.0)
-        surface = np.tile(payoff[None, :], (len(y_grid), 1))
-        _apply_pde_boundaries(surface, f_grid, float(strike))
-
-        for _ in range(n_t):
-            _apply_pde_boundaries(surface, f_grid, float(strike))
-            a0_surface = _apply_cross_operator(surface, a_cross, d_f, d_y)
-            a1_surface = _apply_f_operator(surface, a_f, d_f)
-            a2_surface = _apply_y_operator(surface, a_y_lower, a_y_diag, a_y_upper)
-
-            y0_surface = surface + dt * (a0_surface + a1_surface + a2_surface)
-            _apply_pde_boundaries(y0_surface, f_grid, float(strike))
-
-            rhs1 = y0_surface[1:-1, 1:-1] - theta * dt * a1_surface[1:-1, 1:-1]
-            y1_interior = _solve_f_implicit(rhs1, y0_surface, a_f, theta * dt, d_f)
-            y1_surface = y0_surface.copy()
-            y1_surface[1:-1, 1:-1] = y1_interior
-            _apply_pde_boundaries(y1_surface, f_grid, float(strike))
-
-            rhs2 = y1_surface[1:-1, 1:-1] - theta * dt * a2_surface[1:-1, 1:-1]
-            y2_interior = _solve_y_implicit(
-                rhs2,
-                y1_surface,
-                a_y_lower,
-                a_y_diag,
-                a_y_upper,
-                theta * dt,
-            )
-            surface = y1_surface.copy()
-            surface[1:-1, 1:-1] = y2_interior
-            _apply_pde_boundaries(surface, f_grid, float(strike))
-
-        price = _bilinear_interpolate(f_grid, y_grid, surface, params.f0, y0)
+        price, *_ = price_sabr_option(
+            S0=params.f0,
+            K=float(strike),
+            T=float(maturity),
+            r=0.0,
+            alpha=max(params.sigma0, cfg.sigma_floor),
+            beta=params.beta,
+            rho=params.rho,
+            nu=max(params.nu, EPS),
+            M=cfg.n_f,
+            L=cfg.n_y,
+            N=cfg.resolved_n_t(maturity),
+            S_max=cfg.f_max,
+            v_max=cfg.v_max,
+            option_type="call",
+            theta=cfg.theta,
+            verbose=False,
+        )
         prices.append({"strike": float(strike), "fdm_price": float(price), "maturity": float(maturity)})
 
     return pd.DataFrame(prices)
@@ -1696,7 +1457,7 @@ def run_table7_experiment(
     """Reproduce the Table 7 / Figure 2 convergence study.
 
     `benchmark_source="mc"` uses the existing high-resolution Monte Carlo benchmark,
-    while `benchmark_source="fdm"` switches the ATM reference price to the PDE/FDM solver.
+    while `benchmark_source="fdm"` switches the ATM reference price to Group 16's ADI-FD solver.
     """
     params, maturity = _case_params("Case IV")
     setups = _paper_scale_setups(TABLE7_PAPER_REFERENCE, n_paths_override=n_paths_base)
@@ -1708,7 +1469,7 @@ def run_table7_experiment(
             strike=strike,
             config=fdm_config,
         )
-        benchmark_note = "PDE/FDM benchmark"
+        benchmark_note = "Group 16 ADI-FD benchmark"
     else:
         if benchmark_n_paths is None:
             benchmark_n_paths = max(20_000, 2 * int(setups[0]["n_paths"]))
@@ -1800,7 +1561,7 @@ def run_figure3_experiment(
     """Build the Figure 3 comparison dataset between the paper scheme and Islah's approximation.
 
     `benchmark_source="mc"` uses the previous high-resolution Monte Carlo ATM benchmark.
-    `benchmark_source="fdm"` switches the ATM option benchmark to the PDE/FDM solver.
+    `benchmark_source="fdm"` switches the ATM option benchmark to Group 16's ADI-FD solver.
     """
     base_case = case_table_3()["Case V"]
     strike = float(base_case["f0"])
@@ -1815,7 +1576,7 @@ def run_figure3_experiment(
                 strike=strike,
                 config=fdm_config,
             )
-            benchmark_note = "PDE/FDM benchmark"
+            benchmark_note = "Group 16 ADI-FD benchmark"
         else:
             if benchmark_n_paths is None:
                 benchmark_n = max(20_000, 2 * n_paths)
