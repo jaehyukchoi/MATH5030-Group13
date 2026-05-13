@@ -1,3 +1,5 @@
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/numerical-project-team/numerical-project/blob/main/notebooks/paper_reproduction_with_asian.ipynb)
+
 # SABR Simulation Paper Replication
 
 This workspace contains a Python replication scaffold for:
