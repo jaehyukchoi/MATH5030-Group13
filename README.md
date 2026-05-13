@@ -195,7 +195,7 @@ pytest -q .\tests\test_islah_rho1.py
 For an explanation-oriented walkthrough rather than a test log, open:
 
 ```text
-.\notebooks\paper_reproduction_walkthrough.ipynb
+.\notebooks\paper_reproduction_with_asian.ipynb
 ```
 
 For a shorter sanity-check-only notebook, open:
