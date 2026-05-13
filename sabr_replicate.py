@@ -92,15 +92,6 @@ TABLE7_PAPER_REFERENCE = [
     {"n_paths": 2_560_000, "step": 0.0625, "rms_error_x1e3": 0.59, "time_sec": 279.53},
 ]
 
-def _safe_ratio(num: np.ndarray, den: np.ndarray, fallback: float | np.ndarray) -> np.ndarray:
-    """Elementwise ratio with a configurable fallback when the denominator is tiny."""
-    out = np.empty_like(num, dtype=float)
-    mask = np.abs(den) > PDF_FLOOR
-    out[mask] = num[mask] / den[mask]
-    out[~mask] = fallback if np.isscalar(fallback) else np.asarray(fallback)[~mask]
-    return out
-
-
 def _correlated_drift_term(
     sigma_t: np.ndarray,
     sigma_next: np.ndarray,
@@ -117,22 +108,6 @@ def _correlated_drift_term(
     if abs(nu) < EPS:
         return np.zeros_like(scale, dtype=float)
     return rho * (sigma_next - sigma_t) / (nu * scale)
-
-
-def _sln_w_from_skewness(skewness: np.ndarray) -> np.ndarray:
-    """Recover `w = exp(sigma^2) - 1` from skewness using the cubic in Proposition 1."""
-    s2 = np.asarray(skewness, dtype=float) ** 2
-    x = 2.0 * np.cosh(np.arccosh(1.0 + 0.5 * s2) / 3.0)
-    return np.maximum(x - 2.0, 0.0)
-
-
-def _lognormal_shape_stats_from_w(w: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return CV, skewness, and ex-kurtosis for a unit-mean lognormal with variance ratio `w`."""
-    w = np.asarray(w, dtype=float)
-    cv = np.sqrt(np.maximum(w, 0.0))
-    skewness = (w + 3.0) * cv
-    ex_kurtosis = w**4 + 6.0 * w**3 + 15.0 * w**2 + 16.0 * w
-    return cv, skewness, ex_kurtosis
 
 
 def _resolve_benchmark(
@@ -256,14 +231,8 @@ def finite_difference_call_prices(
 
     cfg = FDMConfig() if config is None else config
     price_sabr_option = _group16_price_sabr_option()
-    # Group 16's package defaults to v_max=max(5*sigma0, 1).  That is too
-    # narrow for the stressed long-maturity cases in the SABR paper, especially
-    # Case IV with sigma0=0.4, nu=0.8, T=4.  A wider volatility domain avoids
-    # clipping the PDE solution at the upper volatility boundary.
-    v_max = cfg.v_max if cfg.v_max is not None else max(10.0 * params.sigma0, 1.0)
     prices = []
     for strike in strikes:
-        f_max = cfg.f_max if cfg.f_max is not None else 8.0 * max(params.f0, float(strike))
         price, *_ = price_sabr_option(
             S0=params.f0,
             K=float(strike),
@@ -276,8 +245,8 @@ def finite_difference_call_prices(
             M=cfg.n_f,
             L=cfg.n_y,
             N=cfg.resolved_n_t(maturity),
-            S_max=f_max,
-            v_max=v_max,
+            S_max=cfg.f_max,
+            v_max=cfg.v_max,
             option_type="call",
             theta=cfg.theta,
             verbose=False,
@@ -366,78 +335,36 @@ def sample_sigma_next(
     return sigma_t * np.exp(nu * math.sqrt(h) * z - 0.5 * nu * nu * h)
 
 
-def conditional_integrated_variance_moments(
+def conditional_integrated_variance_stats(
     sigma_t: np.ndarray,
     sigma_next: np.ndarray,
     nu: float,
     h: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return the first four raw moments of `I_t^h`.
-
-    We now delegate the raw-moment evaluation to `pyfeng.SabrMcTimeDisc`, which
-    already implements the conditional average-variance moment formulas used in
-    SABR literature. This keeps the project focused on the paper-specific
-    conditional forward / CEV machinery rather than reimplementing the same
-    average-variance building blocks.
-    """
+    """Return mean, CV, skewness, and excess kurtosis using PyFeng's formulas."""
     _require_pyfeng()
     sigma_t = np.asarray(sigma_t, dtype=float)
     sigma_next = np.asarray(sigma_next, dtype=float)
     hat_nu = nu * math.sqrt(h)
 
     if abs(hat_nu) < EPS:
+        zeros = np.zeros_like(sigma_t, dtype=float)
         ones = np.ones_like(sigma_t, dtype=float)
-        return ones, ones, ones, ones
+        return ones, zeros, zeros, zeros
 
     z_hat = np.log(sigma_next / sigma_t) / hat_nu
-    mu1, mu2_raw, mu3_raw, mu4_raw = pf.SabrMcTimeDisc.cond_avgvar_mvsk(
+    mean, var_scaled, skewness, ex_kurtosis = pf.SabrMcTimeDisc.cond_avgvar_mvsk(
         abs(hat_nu),
         z_hat,
-        mnc=True,
+        mnc=False,
     )
+    cv = np.sqrt(np.maximum(var_scaled, 0.0))
     return (
-        np.asarray(mu1, dtype=float),
-        np.asarray(mu2_raw, dtype=float),
-        np.asarray(mu3_raw, dtype=float),
-        np.asarray(mu4_raw, dtype=float),
+        np.asarray(mean, dtype=float),
+        np.asarray(cv, dtype=float),
+        np.asarray(skewness, dtype=float),
+        np.asarray(ex_kurtosis, dtype=float),
     )
-
-
-def raw_moments_to_central_stats(
-    mu1: np.ndarray,
-    mu2_raw: np.ndarray,
-    mu3_raw: np.ndarray,
-    mu4_raw: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Convert raw moments into mean, variance, std, CV, skewness, and ex-kurtosis.
-
-    Implements the statistics defined in Remark 5 after Proposition 2. This helper
-    is public and notebook-friendly for Figure 1 style moment comparisons.
-    """
-    mean = np.asarray(mu1, dtype=float)
-    var = np.maximum(mu2_raw - mean * mean, 0.0)
-    std = np.sqrt(var)
-    cv = _safe_ratio(std, np.maximum(mean, PDF_FLOOR), fallback=0.0)
-
-    centered3 = mu3_raw - 3.0 * mean * mu2_raw + 2.0 * mean**3
-    centered4 = mu4_raw - 4.0 * mean * mu3_raw + 6.0 * mean * mean * mu2_raw - 3.0 * mean**4
-
-    skewness = _safe_ratio(centered3, np.maximum(var * std, PDF_FLOOR), fallback=0.0)
-    ex_kurtosis = _safe_ratio(centered4, np.maximum(var * var, PDF_FLOOR), fallback=3.0) - 3.0
-    return mean, var, std, cv, skewness, ex_kurtosis
-
-
-def moment_statistics_from_raw(
-    mu1: np.ndarray,
-    mu2_raw: np.ndarray,
-    mu3_raw: np.ndarray,
-    mu4_raw: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Backward-compatible thin wrapper over `raw_moments_to_central_stats`."""
-    _, var, _, cv, skewness, ex_kurtosis = raw_moments_to_central_stats(
-        mu1, mu2_raw, mu3_raw, mu4_raw
-    )
-    return var, cv, skewness, ex_kurtosis
 
 
 def conditional_integrated_variance_lnshift_params(
@@ -447,26 +374,31 @@ def conditional_integrated_variance_lnshift_params(
     h: float,
     ratio: float = 5.0 / 6.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return shifted-lognormal parameters for the conditional average variance.
-
-    Some `pyfeng` releases expose this as
-    `SabrMcTimeDisc.cond_avgvar_lnshift_params`, but the public dependency range
-    used by this project does not guarantee that helper exists.  The parameters
-    are recovered from the raw conditional moments that are available across the
-    supported releases.
-    """
+    """Return shifted-lognormal parameters for the conditional average variance."""
     if not (0.0 < ratio <= 1.0):
         raise ValueError("ratio must be in (0, 1].")
 
-    mu1, mu2_raw, mu3_raw, mu4_raw = conditional_integrated_variance_moments(
-        sigma_t, sigma_next, nu, h
-    )
-    _, _, _, cv, _, _ = raw_moments_to_central_stats(mu1, mu2_raw, mu3_raw, mu4_raw)
+    _require_pyfeng()
+    sigma_t = np.asarray(sigma_t, dtype=float)
+    sigma_next = np.asarray(sigma_next, dtype=float)
+    hat_nu = nu * math.sqrt(h)
 
-    lambda_sln = np.full_like(np.asarray(mu1, dtype=float), float(ratio), dtype=float)
-    w_sln = np.maximum(cv * cv / (lambda_sln * lambda_sln), 0.0)
-    sigma_sln = np.sqrt(np.log1p(w_sln))
-    return np.asarray(mu1, dtype=float), sigma_sln, lambda_sln
+    if abs(hat_nu) < EPS:
+        ones = np.ones_like(sigma_t, dtype=float)
+        zeros = np.zeros_like(sigma_t, dtype=float)
+        return ones, zeros, np.full_like(sigma_t, float(ratio), dtype=float)
+
+    z_hat = np.log(sigma_next / sigma_t) / hat_nu
+    mu1, sigma_sln, lambda_sln = pf.SabrMcTimeDisc.cond_avgvar_lnshift_params(
+        abs(hat_nu),
+        z_hat,
+        ratio=ratio,
+    )
+    return (
+        np.asarray(mu1, dtype=float),
+        np.asarray(sigma_sln, dtype=float),
+        np.full_like(np.asarray(mu1, dtype=float), float(lambda_sln), dtype=float),
+    )
 
 
 def sample_conditional_integrated_variance(
@@ -932,27 +864,26 @@ def figure1_moment_comparison(
     sigma_t_arr = np.full_like(z_hat, float(sigma_t))
     sigma_next = sigma_t_arr * np.exp(hat_nu * z_hat)
 
-    mu1, mu2_raw, mu3_raw, mu4_raw = conditional_integrated_variance_moments(
+    _, cv_exact, skew_exact, exk_exact = conditional_integrated_variance_stats(
         sigma_t_arr, sigma_next, nu=float(hat_nu), h=1.0
-    )
-    _, _, _, cv_exact, skew_exact, exk_exact = raw_moments_to_central_stats(
-        mu1, mu2_raw, mu3_raw, mu4_raw
     )
 
     # LN approximation: fit variance only.
-    w_ln = cv_exact**2
-    _, skew_ln, exk_ln = _lognormal_shape_stats_from_w(w_ln)
+    ln_dist = pf.DistHelperLnShift(lam=1.0)
+    ln_dist.fit([np.ones_like(cv_exact), cv_exact**2], lam=1.0)
+    _, _, skew_ln, exk_ln = ln_dist.mvsk()
 
     # SLN with fixed lambda = 5/6: fit variance through sigma.
     lambda_fixed = 5.0 / 6.0
-    w_sln_fixed = cv_exact**2 / (lambda_fixed**2)
-    _, skew_sln_fixed, exk_sln_fixed = _lognormal_shape_stats_from_w(w_sln_fixed)
+    sln_fixed = pf.DistHelperLnShift(lam=lambda_fixed)
+    sln_fixed.fit([np.ones_like(cv_exact), cv_exact**2], lam=lambda_fixed)
+    _, _, skew_sln_fixed, exk_sln_fixed = sln_fixed.mvsk()
 
-    # SLN with exact lambda: fit sigma to exact skewness, then lambda from CV.
-    w_sln_exact = _sln_w_from_skewness(skew_exact)
-    sqrt_w_exact = np.sqrt(np.maximum(w_sln_exact, 0.0))
-    lambda_exact = _safe_ratio(cv_exact, np.maximum(sqrt_w_exact, PDF_FLOOR), fallback=0.0)
-    _, skew_sln_exact, exk_sln_exact = _lognormal_shape_stats_from_w(w_sln_exact)
+    # SLN with exact lambda: fit variance and skewness.
+    sln_exact = pf.DistHelperLnShift()
+    sln_exact.fit([np.ones_like(cv_exact), cv_exact**2, skew_exact])
+    _, _, skew_sln_exact, exk_sln_exact = sln_exact.mvsk()
+    lambda_exact = np.asarray(sln_exact.lam, dtype=float)
 
     return pd.DataFrame(
         {
