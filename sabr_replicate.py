@@ -374,7 +374,13 @@ def conditional_integrated_variance_lnshift_params(
     h: float,
     ratio: float = 5.0 / 6.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return shifted-lognormal parameters for the conditional average variance."""
+    """Return shifted-lognormal parameters for the conditional average variance.
+
+    PyFeng provides the conditional average-variance moments across supported
+    versions. Some releases also expose the shifted-lognormal fit directly; when
+    they do not, recover Algorithm 1's fixed-shift shape parameter from the
+    PyFeng-backed coefficient of variation.
+    """
     if not (0.0 < ratio <= 1.0):
         raise ValueError("ratio must be in (0, 1].")
 
@@ -388,12 +394,17 @@ def conditional_integrated_variance_lnshift_params(
         zeros = np.zeros_like(sigma_t, dtype=float)
         return ones, zeros, np.full_like(sigma_t, float(ratio), dtype=float)
 
-    z_hat = np.log(sigma_next / sigma_t) / hat_nu
-    mu1, sigma_sln, lambda_sln = pf.SabrMcTimeDisc.cond_avgvar_lnshift_params(
-        abs(hat_nu),
-        z_hat,
-        ratio=ratio,
-    )
+    if hasattr(pf.SabrMcTimeDisc, "cond_avgvar_lnshift_params"):
+        z_hat = np.log(sigma_next / sigma_t) / hat_nu
+        mu1, sigma_sln, lambda_sln = pf.SabrMcTimeDisc.cond_avgvar_lnshift_params(
+            abs(hat_nu),
+            z_hat,
+            ratio=ratio,
+        )
+    else:
+        mu1, cv, _, _ = conditional_integrated_variance_stats(sigma_t, sigma_next, nu, h)
+        lambda_sln = float(ratio)
+        sigma_sln = np.sqrt(np.log1p(np.maximum(cv * cv / (lambda_sln * lambda_sln), 0.0)))
     return (
         np.asarray(mu1, dtype=float),
         np.asarray(sigma_sln, dtype=float),
