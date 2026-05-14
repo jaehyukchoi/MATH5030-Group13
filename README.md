@@ -1,9 +1,9 @@
 ## Demo notebook
 
 
-Open the `pyfeng-refactor-moments` branch version:
+Open the main branch version:
 
-[![Open pyfeng-refactor-moments in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/numerical-project-team/numerical-project/blob/pyfeng-refactor-moments/notebooks/paper_reproduction_with_asian.ipynb)
+[![Open main in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/numerical-project-team/numerical-project/blob/main/notebooks/paper_reproduction_with_asian.ipynb)
 
 # SABR Simulation Paper Replication
 
